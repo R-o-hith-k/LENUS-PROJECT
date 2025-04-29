@@ -1,0 +1,141 @@
+import max30102
+import hrcalc
+import time
+import BlynkLib as blynklib
+import random
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+import requests
+
+BLYNK_AUTH = 'OaSo1xx1fWEQ1eEoeHnfBrRJxien8SoM'
+blynk = blynklib.Blynk(BLYNK_AUTH, server="blynk.cloud", port=80)
+
+m = max30102.MAX30102()
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1115(i2c)
+flex_sensor = AnalogIn(ads, ADS.P0)
+
+x = None
+y = None
+temp = None
+breathing_rate = None
+
+# URLs for server communication (Choose based on the network access)
+LOCAL_SERVER_URL = "http://127.0.0.1:5000/store-data"
+NETWORK_SERVER_URL = "http://192.168.29.196:5000/store-data"
+
+def read_sensor():
+    global x, y, temp
+    while True:
+        red, ir = m.read_sequential()
+        hr, hr_valid, spo2, spo2_valid = hrcalc.calc_hr_and_spo2(ir, red)
+        if hr_valid and spo2_valid:
+            x = hr
+            y = spo2
+            temp = round(random.uniform(36, 38), 1)
+            print(f"Heart Rate (x): {x} BPM")
+            print(f"SpO2 Level (y): {y}%")
+            print(f"Temperature: {temp}°C")
+            break
+        else:
+            print("Invalid readings. Retrying...")
+            time.sleep(1)
+
+def calculate_breathing_rate():
+    global breathing_rate
+    breath_count = 0
+    threshold = 5000
+    last_state = False
+
+    start_time = time.time()
+    while time.time() - start_time < 15:
+        sensor_value = flex_sensor.value
+        if sensor_value > threshold and not last_state:
+            breath_count += 1
+            last_state = True
+        elif sensor_value < threshold:
+            last_state = False
+
+        print(f"Sensor Value: {sensor_value}, Breaths: {breath_count}")
+        time.sleep(0.5)
+
+    breathing_rate = breath_count * 4
+    print(f"Breathing Rate: {breathing_rate} BPM")
+
+def send_data():
+    global x, y, temp, breathing_rate
+    if x is not None and y is not None and temp is not None and breathing_rate is not None:
+        print(f"Sending to Blynk -> Heart Rate: {x} BPM, SpO2: {y}%, Temperature: {temp}°C, Breathing Rate: {breathing_rate} BPM")
+
+        # Send Data to Blynk
+        try:
+            for _ in range(5):
+                blynk.run()
+                blynk.virtual_write(5, x)
+                time.sleep(1)
+                blynk.virtual_write(6, y)
+                time.sleep(1)
+                blynk.virtual_write(7, temp)
+                time.sleep(1)
+                blynk.virtual_write(8, breathing_rate)
+                time.sleep(1)
+
+                # Check for critical condition
+                if temp > 38 or y < 92:
+                    blynk.virtual_write(3, "USER UNDER CRITICAL CONDITION")
+                else:
+                    blynk.virtual_write(3, ".")
+                print("Data sent to Blynk successfully!")
+               
+                break
+        except BrokenPipeError:
+            print("Connection to Blynk lost! Reconnecting...")
+            reconnect_blynk()
+
+        # Send Data to Server
+        data = {
+            "heart_rate": x,
+            "spo2": y,
+            "temperature": temp,
+            "breathing_rate": breathing_rate
+        }
+
+        # Try sending to the network server first, then fallback to localhost
+        try:
+            print("Sending data to the Network Server...")
+            response = requests.post(NETWORK_SERVER_URL, json=data)
+            if response.status_code == 200:
+                print("Data sent to Network Server successfully!")
+            else:
+                print(f"Failed to send to Network Server. Status code: {response.status_code}, Message: {response.text}")
+        except Exception as e:
+            print(f"Network server error: {e}")
+            print("Attempting to send data to the Local Server...")
+
+            try:
+                response = requests.post(LOCAL_SERVER_URL, json=data)
+                if response.status_code == 200:
+                    print("Data sent to Local Server successfully!")
+                else:
+                    print(f"Failed to send to Local Server. Status code: {response.status_code}, Message: {response.text}")
+            except Exception as e:
+                print(f"Local server error: {e}")
+
+    else:
+        print("No valid data to send.")
+
+def reconnect_blynk():
+    global blynk
+    try:
+        time.sleep(5)
+        blynk = blynklib.Blynk(BLYNK_AUTH, server="blynk.cloud", port=80)
+        print("Reconnected to Blynk!")
+    except Exception as e:
+        print(f"Failed to reconnect: {e}")
+
+if __name__ == "__main__":
+    read_sensor()
+    calculate_breathing_rate()
+    send_data()
